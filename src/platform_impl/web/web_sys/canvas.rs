@@ -35,6 +35,7 @@ pub struct Canvas {
     id: WindowId,
     pub has_focus: Rc<Cell<bool>>,
     pub prevent_default: Rc<Cell<bool>>,
+    pub composing: Rc<Cell<bool>>,
     pub is_intersecting: Option<bool>,
     on_touch_start: Option<EventListenerHandle<dyn FnMut(Event)>>,
     on_focus: Option<EventListenerHandle<dyn FnMut(FocusEvent)>>,
@@ -62,8 +63,8 @@ pub struct Common {
     /// the DPI factor is maintained. Note: this is read-only because we use a pointer to this
     /// for [`WindowHandle`][rwh_06::WindowHandle].
     raw: Rc<HtmlCanvasElement>,
-    /// Owned `EditContext` instance, if the browser supports it
-    /// (Chromium 121+). When `Some`, IME events are routed through
+    /// Owned `EditContext` instance, if the browser supports it.
+    /// When `Some`, IME events are routed through
     /// it instead of through canvas keyboard events, which lets
     /// the OS IME composition (CJK, Indic, etc.) hand committed
     /// text into a wgpu canvas. `None` on non-Chromium browsers
@@ -123,8 +124,8 @@ impl Canvas {
 
         let cursor = CursorHandler::new(main_thread, canvas.clone(), style.clone());
 
-        // Optional EditContext for IME (Chromium 121+). Other
-        // browsers leave this `None` and IME stays unavailable.
+        // Optional EditContext for IME, for browser that support it. On other browsers,
+        // IME is simply not available.
         let edit_context = Reflect::get(&window, &JsValue::from_str("EditContext"))
             .ok()
             .filter(|v| !v.is_undefined())
@@ -176,6 +177,7 @@ impl Canvas {
             id,
             has_focus: Rc::new(Cell::new(false)),
             prevent_default: Rc::new(Cell::new(attr.platform_specific.prevent_default)),
+            composing: Rc::new(Cell::new(false)),
             is_intersecting: None,
             on_touch_start: None,
             on_blur: None,
@@ -299,8 +301,12 @@ impl Canvas {
         F: 'static + FnMut(PhysicalKey, Key, Option<SmolStr>, KeyLocation, bool, ModifiersState),
     {
         let prevent_default = Rc::clone(&self.prevent_default);
+        let composing = Rc::clone(&self.composing);
         self.on_keyboard_release =
             Some(self.common.add_event("keyup", move |event: KeyboardEvent| {
+                if composing.get() || is_ime_composing(&event) {
+                    return;
+                }
                 if prevent_default.get() {
                     event.prevent_default();
                 }
@@ -322,8 +328,13 @@ impl Canvas {
         F: 'static + FnMut(PhysicalKey, Key, Option<SmolStr>, KeyLocation, bool, ModifiersState),
     {
         let prevent_default = Rc::clone(&self.prevent_default);
+        let composing = Rc::clone(&self.composing);
         self.on_keyboard_press =
             Some(self.common.add_event("keydown", move |event: KeyboardEvent| {
+                let suppress = composing.get() || is_ime_composing(&event);
+                if suppress {
+                    return;
+                }
                 if prevent_default.get() {
                     event.prevent_default();
                 }
@@ -471,8 +482,10 @@ impl Canvas {
         F: 'static + FnMut(Option<String>, Option<(usize, usize)>),
     {
         let prevent_default = Rc::clone(&self.prevent_default);
+        let composing = Rc::clone(&self.composing);
         self.on_composition_start =
             self.common.add_ime_event("compositionstart", move |event: CompositionEvent| {
+                composing.set(true);
                 if prevent_default.get() {
                     event.prevent_default();
                 }
@@ -485,8 +498,10 @@ impl Canvas {
         F: 'static + FnMut(Option<String>),
     {
         let prevent_default = Rc::clone(&self.prevent_default);
+        let composing = Rc::clone(&self.composing);
         self.on_composition_end =
             self.common.add_ime_event("compositionend", move |event: CompositionEvent| {
+                composing.set(false);
                 if prevent_default.get() {
                     event.prevent_default();
                 }
@@ -503,36 +518,11 @@ impl Canvas {
             if prevent_default.get() {
                 event.prevent_default();
             }
-            // `textupdate` fires on the EditContext object
-            // itself, not on the canvas. Pull text +
-            // updateRangeEnd off it via Reflect.
-            let edit_context = JsValue::from(event.target());
             let text_update_event = JsValue::from(event);
-            let Ok(text) = Reflect::get(&text_update_event, &JsValue::from_str("text")) else {
-                return;
-            };
-            let Ok(update_range_end) =
-                Reflect::get(&text_update_event, &JsValue::from_str("updateRangeEnd"))
-            else {
-                return;
-            };
-
-            handler(text.as_string(), None);
-
-            // Clear the text update region so we don't get
-            // repeated updates for the same preedit. The
-            // EditContext API has no `commit()` — instead we
-            // call `updateText(0, end, "")` to consume what
-            // we just read.
-            if let Ok(func) = Reflect::get(&edit_context, &JsValue::from_str("updateText")) {
-                let func: &Function = func.unchecked_ref();
-                let _ = func.call3(
-                    &edit_context,
-                    &JsValue::from_f64(0.0),
-                    &JsValue::from_f64(update_range_end.as_f64().unwrap_or(0.0)),
-                    &JsValue::from_str(""),
-                );
-            }
+            let text = Reflect::get(&text_update_event, &JsValue::from_str("text"))
+                .ok()
+                .and_then(|v| v.as_string());
+            handler(text, None);
         });
     }
 
@@ -555,27 +545,58 @@ impl Canvas {
         let _ = Reflect::set(&canvas_js, &JsValue::from_str("editContext"), &JsValue::NULL);
     }
 
-    /// Tell the EditContext where the text cursor lives so the
-    /// browser places its IME candidate window next to it. The
-    /// `(x, y)` is in iced canvas-local logical pixels — we
-    /// translate to viewport coords by adding the canvas's
-    /// position via `getBoundingClientRect`. Without this the
-    /// browser defaults to the bottom-left of the canvas.
     pub(crate) fn update_character_bounds(&self, x: f64, y: f64, width: f64, height: f64) {
+        const BOUNDS_RANGE: usize = 64;
+
         let Some(edit_context) = self.common.raw_edit_context.as_ref() else {
             return;
         };
         let canvas_rect = self.common.raw.get_bounding_client_rect();
         let vp_x = canvas_rect.x() + x;
         let vp_y = canvas_rect.y() + y;
-        let Ok(rect) =
-            web_sys::DomRect::new_with_x_and_y_and_width_and_height(vp_x, vp_y, width, height)
-        else {
-            return;
-        };
-        let bounds = Array::new();
-        bounds.push(&rect);
         let edit_context_js: &JsValue = edit_context.deref();
+
+        // Chromium positions the IME candidate window primarily off
+        // `updateSelectionBounds`, then `updateControlBounds`, then
+        // (only if both are unset) the per-character bounds set via
+        // `updateCharacterBounds`. We push all three so the candidate
+        // window lands next to the caret regardless of which one the
+        // browser version prefers.
+        let caret_rect = match web_sys::DomRect::new_with_x_and_y_and_width_and_height(
+            vp_x, vp_y, width, height,
+        ) {
+            Ok(rect) => rect,
+            Err(_) => return,
+        };
+
+        if let Ok(f) = Reflect::get(edit_context_js, &JsValue::from_str("updateSelectionBounds")) {
+            let f: &Function = f.unchecked_ref();
+            let _ = f.call1(edit_context_js, &caret_rect);
+        }
+
+        let control_rect = match web_sys::DomRect::new_with_x_and_y_and_width_and_height(
+            canvas_rect.x(),
+            canvas_rect.y(),
+            canvas_rect.width(),
+            canvas_rect.height(),
+        ) {
+            Ok(rect) => rect,
+            Err(_) => return,
+        };
+        if let Ok(f) = Reflect::get(edit_context_js, &JsValue::from_str("updateControlBounds")) {
+            let f: &Function = f.unchecked_ref();
+            let _ = f.call1(edit_context_js, &control_rect);
+        }
+
+        let bounds = Array::new();
+        for _ in 0..BOUNDS_RANGE {
+            let Ok(rect) =
+                web_sys::DomRect::new_with_x_and_y_and_width_and_height(vp_x, vp_y, width, height)
+            else {
+                return;
+            };
+            bounds.push(&rect);
+        }
         let Ok(update_fn) =
             Reflect::get(edit_context_js, &JsValue::from_str("updateCharacterBounds"))
         else {
@@ -678,10 +699,6 @@ impl Common {
         EventListenerHandle::new(self.raw.deref().clone(), event_name, Closure::new(handler))
     }
 
-    /// Attach an event listener to the owned `EditContext` rather
-    /// than the canvas. Returns `None` if the browser doesn't
-    /// support EditContext — IME just stays unavailable in that
-    /// case (Safari, Firefox).
     pub fn add_ime_event<E, F>(
         &self,
         event_name: &'static str,
@@ -727,4 +744,8 @@ impl Style {
     pub(crate) fn set(&self, property: &str, value: &str) {
         self.write.set_property(property, value).expect("Property is read only");
     }
+}
+
+fn is_ime_composing(event: &KeyboardEvent) -> bool {
+    event.is_composing() || event.key_code() == 229
 }
