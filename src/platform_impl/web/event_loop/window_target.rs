@@ -605,6 +605,10 @@ impl ActiveEventLoop {
                 if let Some(data) = data {
                     runner.send_event(Event::WindowEvent {
                         window_id: RootWindowId(id),
+                        event: WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+                    });
+                    runner.send_event(Event::WindowEvent {
+                        window_id: RootWindowId(id),
                         event: WindowEvent::Ime(Ime::Commit(data)),
                     });
                 }
