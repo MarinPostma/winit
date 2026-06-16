@@ -3,12 +3,13 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
+use js_sys::{Array, Function, Reflect};
 use smol_str::SmolStr;
 use wasm_bindgen::closure::Closure;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
-    CssStyleDeclaration, Document, Event, FocusEvent, HtmlCanvasElement, KeyboardEvent,
-    PointerEvent, WheelEvent,
+    CompositionEvent, CssStyleDeclaration, Document, Event, EventTarget, FocusEvent,
+    HtmlCanvasElement, KeyboardEvent, PointerEvent, WheelEvent,
 };
 
 use crate::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
@@ -48,6 +49,9 @@ pub struct Canvas {
     animation_frame_handler: AnimationFrameHandler,
     on_touch_end: Option<EventListenerHandle<dyn FnMut(Event)>>,
     on_context_menu: Option<EventListenerHandle<dyn FnMut(PointerEvent)>>,
+    on_composition_start: Option<EventListenerHandle<dyn FnMut(CompositionEvent)>>,
+    on_composition_end: Option<EventListenerHandle<dyn FnMut(CompositionEvent)>>,
+    on_text_update: Option<EventListenerHandle<dyn FnMut(Event)>>,
     pub cursor: CursorHandler,
 }
 
@@ -58,6 +62,13 @@ pub struct Common {
     /// the DPI factor is maintained. Note: this is read-only because we use a pointer to this
     /// for [`WindowHandle`][rwh_06::WindowHandle].
     raw: Rc<HtmlCanvasElement>,
+    /// Owned `EditContext` instance, if the browser supports it
+    /// (Chromium 121+). When `Some`, IME events are routed through
+    /// it instead of through canvas keyboard events, which lets
+    /// the OS IME composition (CJK, Indic, etc.) hand committed
+    /// text into a wgpu canvas. `None` on non-Chromium browsers
+    /// — IME is unavailable there.
+    raw_edit_context: Option<Rc<JsValue>>,
     style: Style,
     old_size: Rc<Cell<PhysicalSize<u32>>>,
     current_size: Rc<Cell<PhysicalSize<u32>>>,
@@ -112,10 +123,21 @@ impl Canvas {
 
         let cursor = CursorHandler::new(main_thread, canvas.clone(), style.clone());
 
+        // Optional EditContext for IME (Chromium 121+). Other
+        // browsers leave this `None` and IME stays unavailable.
+        let edit_context = Reflect::get(&window, &JsValue::from_str("EditContext"))
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .and_then(|ctor| {
+                let ctor: &Function = ctor.unchecked_ref();
+                Reflect::construct(ctor, &Array::new()).ok()
+            });
+
         let common = Common {
             window: window.clone(),
             document: document.clone(),
             raw: Rc::new(canvas.clone()),
+            raw_edit_context: edit_context.map(Rc::new),
             style,
             old_size: Rc::default(),
             current_size: Rc::default(),
@@ -168,6 +190,9 @@ impl Canvas {
             animation_frame_handler: AnimationFrameHandler::new(window),
             on_touch_end: None,
             on_context_menu: None,
+            on_composition_start: None,
+            on_composition_end: None,
+            on_text_update: None,
             cursor,
         })
     }
@@ -441,6 +466,125 @@ impl Canvas {
             }));
     }
 
+    pub(crate) fn on_composition_start<F>(&mut self, mut handler: F)
+    where
+        F: 'static + FnMut(Option<String>, Option<(usize, usize)>),
+    {
+        let prevent_default = Rc::clone(&self.prevent_default);
+        self.on_composition_start =
+            self.common.add_ime_event("compositionstart", move |event: CompositionEvent| {
+                if prevent_default.get() {
+                    event.prevent_default();
+                }
+                handler(event.data(), None);
+            });
+    }
+
+    pub(crate) fn on_composition_end<F>(&mut self, mut handler: F)
+    where
+        F: 'static + FnMut(Option<String>),
+    {
+        let prevent_default = Rc::clone(&self.prevent_default);
+        self.on_composition_end =
+            self.common.add_ime_event("compositionend", move |event: CompositionEvent| {
+                if prevent_default.get() {
+                    event.prevent_default();
+                }
+                handler(event.data());
+            });
+    }
+
+    pub(crate) fn on_text_update<F>(&mut self, mut handler: F)
+    where
+        F: 'static + FnMut(Option<String>, Option<(usize, usize)>),
+    {
+        let prevent_default = Rc::clone(&self.prevent_default);
+        self.on_text_update = self.common.add_ime_event("textupdate", move |event: Event| {
+            if prevent_default.get() {
+                event.prevent_default();
+            }
+            // `textupdate` fires on the EditContext object
+            // itself, not on the canvas. Pull text +
+            // updateRangeEnd off it via Reflect.
+            let edit_context = JsValue::from(event.target());
+            let text_update_event = JsValue::from(event);
+            let Ok(text) = Reflect::get(&text_update_event, &JsValue::from_str("text")) else {
+                return;
+            };
+            let Ok(update_range_end) =
+                Reflect::get(&text_update_event, &JsValue::from_str("updateRangeEnd"))
+            else {
+                return;
+            };
+
+            handler(text.as_string(), None);
+
+            // Clear the text update region so we don't get
+            // repeated updates for the same preedit. The
+            // EditContext API has no `commit()` — instead we
+            // call `updateText(0, end, "")` to consume what
+            // we just read.
+            if let Ok(func) = Reflect::get(&edit_context, &JsValue::from_str("updateText")) {
+                let func: &Function = func.unchecked_ref();
+                let _ = func.call3(
+                    &edit_context,
+                    &JsValue::from_f64(0.0),
+                    &JsValue::from_f64(update_range_end.as_f64().unwrap_or(0.0)),
+                    &JsValue::from_str(""),
+                );
+            }
+        });
+    }
+
+    pub(crate) fn is_support_edit_context(&self) -> bool {
+        self.common.raw_edit_context.is_some()
+    }
+
+    pub(crate) fn enable_edit_context(&self) {
+        if let Some(raw_edit_context) = &self.common.raw_edit_context {
+            let canvas_js = JsValue::from(self.common.raw.deref());
+            let _ = Reflect::set(&canvas_js, &JsValue::from_str("editContext"), raw_edit_context);
+        }
+    }
+
+    pub(crate) fn disable_edit_context(&self) {
+        if self.common.raw_edit_context.is_none() {
+            return;
+        }
+        let canvas_js = JsValue::from(self.common.raw.deref());
+        let _ = Reflect::set(&canvas_js, &JsValue::from_str("editContext"), &JsValue::NULL);
+    }
+
+    /// Tell the EditContext where the text cursor lives so the
+    /// browser places its IME candidate window next to it. The
+    /// `(x, y)` is in iced canvas-local logical pixels — we
+    /// translate to viewport coords by adding the canvas's
+    /// position via `getBoundingClientRect`. Without this the
+    /// browser defaults to the bottom-left of the canvas.
+    pub(crate) fn update_character_bounds(&self, x: f64, y: f64, width: f64, height: f64) {
+        let Some(edit_context) = self.common.raw_edit_context.as_ref() else {
+            return;
+        };
+        let canvas_rect = self.common.raw.get_bounding_client_rect();
+        let vp_x = canvas_rect.x() + x;
+        let vp_y = canvas_rect.y() + y;
+        let Ok(rect) =
+            web_sys::DomRect::new_with_x_and_y_and_width_and_height(vp_x, vp_y, width, height)
+        else {
+            return;
+        };
+        let bounds = Array::new();
+        bounds.push(&rect);
+        let edit_context_js: &JsValue = edit_context.deref();
+        let Ok(update_fn) =
+            Reflect::get(edit_context_js, &JsValue::from_str("updateCharacterBounds"))
+        else {
+            return;
+        };
+        let update_fn: &Function = update_fn.unchecked_ref();
+        let _ = update_fn.call2(edit_context_js, &JsValue::from_f64(0.0), &bounds);
+    }
+
     pub fn request_fullscreen(&self) {
         fullscreen::request_fullscreen(self.document(), self.raw());
     }
@@ -515,6 +659,9 @@ impl Canvas {
         self.animation_frame_handler.cancel();
         self.on_touch_end = None;
         self.on_context_menu = None;
+        self.on_composition_start = None;
+        self.on_composition_end = None;
+        self.on_text_update = None;
     }
 }
 
@@ -529,6 +676,24 @@ impl Common {
         F: 'static + FnMut(E),
     {
         EventListenerHandle::new(self.raw.deref().clone(), event_name, Closure::new(handler))
+    }
+
+    /// Attach an event listener to the owned `EditContext` rather
+    /// than the canvas. Returns `None` if the browser doesn't
+    /// support EditContext — IME just stays unavailable in that
+    /// case (Safari, Firefox).
+    pub fn add_ime_event<E, F>(
+        &self,
+        event_name: &'static str,
+        handler: F,
+    ) -> Option<EventListenerHandle<dyn FnMut(E)>>
+    where
+        E: 'static + AsRef<web_sys::Event> + wasm_bindgen::convert::FromWasmAbi,
+        F: 'static + FnMut(E),
+    {
+        let edit_context = self.raw_edit_context.as_ref()?.deref().clone();
+        let target: EventTarget = edit_context.unchecked_into();
+        Some(EventListenerHandle::new(target, event_name, Closure::new(handler)))
     }
 
     pub fn raw(&self) -> &HtmlCanvasElement {
